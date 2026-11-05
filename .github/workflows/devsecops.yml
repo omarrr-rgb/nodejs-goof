@@ -1,0 +1,213 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DD_PRODUCT_NAME: "OAMN"                 
+  DD_URL: "https://demo.defectdojo.org"
+  DD_PRODUCT_TYPE: "Research and Development"
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1) Escaneo de secretos (BLOQUEANTE: sin continue-on-error)
+  # ---------------------------------------------------------------
+  secrets-scan:
+    name: 1 - Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # historial completo para detectar secretos en commits previos
+
+      - name: Instalar Gitleaks
+        run: |
+          VER=8.21.2
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Ejecutar Gitleaks (falla el pipeline si hay secretos)
+        run: |
+          gitleaks detect --source . \
+            --report-format json --report-path gitleaks-report.json \
+            --redact --verbose --exit-code 1
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-results
+          path: gitleaks-report.json
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # 2a) SBOM con Syft  (en paralelo con Grype)
+  # ---------------------------------------------------------------
+  sbom-syft:
+    name: 2a - SBOM (Syft)
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Syft
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Generar SBOM
+        continue-on-error: true
+        run: |
+          syft dir:. -o cyclonedx-json=sbom.cdx.json -o spdx-json=sbom.spdx.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: syft-results
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # 2b) Vulnerabilidades en dependencias con Grype
+  # ---------------------------------------------------------------
+  sca-grype:
+    name: 2b - SCA (Grype)
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Escanear dependencias
+        continue-on-error: true
+        run: |
+          grype dir:. -o json > grype-report.json
+          grype dir:. -o table > grype-report.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grype-results
+          path: |
+            grype-report.json
+            grype-report.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # 3) SAST con Snyk Code (token en secreto cifrado)
+  # ---------------------------------------------------------------
+  sast-snyk:
+    name: 3 - SAST (Snyk Code)
+    needs: [sbom-syft, sca-grype]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Snyk CLI
+        run: npm install -g snyk
+
+      - name: Snyk Code test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk code test --sarif-file-output=snyk-code.sarif
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-results
+          path: snyk-code.sarif
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # 4) DAST con OWASP ZAP (baseline)
+  # ---------------------------------------------------------------
+  dast-zap:
+    name: 4 - DAST (ZAP baseline)
+    needs: sast-snyk
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: ZAP baseline scan
+        continue-on-error: true
+        env:
+          ZAP_URL: ${{ vars.ZAP_TARGET_URL }}   # URL que da el profesor
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm -v "$PWD/zap:/zap/wrk/:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$ZAP_URL" -r zap-report.html -x zap-report.xml -J zap-report.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-results
+          path: zap/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # 5) Subir todo a DefectDojo (import-scan, API v2)
+  # ---------------------------------------------------------------
+  defectdojo-upload:
+    name: 5 - Import a DefectDojo
+    needs: [secrets-scan, sbom-syft, sca-grype, sast-snyk, dast-zap]
+    if: ${{ always() && needs.secrets-scan.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - name: Importar hallazgos
+        env:
+          DD_USERNAME: ${{ secrets.DD_USERNAME }}
+          DD_PASSWORD: ${{ secrets.DD_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ls -R results
+
+          TOKEN=$(curl -sS -X POST "$DD_URL/api/v2/api-token-auth/" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg u "$DD_USERNAME" --arg p "$DD_PASSWORD" '{username:$u,password:$p}')" \
+            | jq -r .token)
+          echo "::add-mask::$TOKEN"
+
+          import_scan() {  # $1=scan_type  $2=archivo  $3=titulo
+            if [ -f "$2" ]; then
+              echo "Importando $2 como '$1'..."
+              curl -sS --fail-with-body -X POST "$DD_URL/api/v2/import-scan/" \
+                -H "Authorization: Token $TOKEN" \
+                -F "scan_type=$1" \
+                -F "file=@$2" \
+                -F "product_name=$DD_PRODUCT_NAME" \
+                -F "product_type_name=$DD_PRODUCT_TYPE" \
+                -F "engagement_name=GitHub Actions run ${GITHUB_RUN_ID}" \
+                -F "test_title=$3" \
+                -F "auto_create_context=true" \
+                -F "active=true" -F "verified=false"
+              echo
+            else
+              echo "No existe $2, se omite."
+            fi
+          }
+
+          import_scan "Gitleaks Scan"   results/gitleaks-results/gitleaks-report.json "Gitleaks"
+          import_scan "CycloneDX Scan"  results/syft-results/sbom.cdx.json            "Syft SBOM"
+          import_scan "Anchore Grype"   results/grype-results/grype-report.json       "Grype"
+          import_scan "SARIF"           results/snyk-results/snyk-code.sarif          "Snyk Code"
+          import_scan "ZAP Scan"        results/zap-results/zap-report.xml            "OWASP ZAP"
